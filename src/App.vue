@@ -1,193 +1,105 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import {
+  CONFLICT_FIELD_LABELS,
+  useLedger,
+  type Batch,
+  type BatchInput,
+  type ConflictField
+} from "./stores/ledger";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const ledger = useLedger();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const notice = ref("");
 
-const project = {
-  "number": 9,
-  "folder": "dfwl/frontend/dfwlfront-9",
-  "framework": "vue",
-  "title": "油品价格维护",
-  "subtitle": "维护挂牌价、记录更新时间，并支持恢复默认价格。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-9-price",
-  "formTitle": "调整油品价格",
-  "primaryAction": "保存价格",
-  "entityLabel": "油品",
-  "statuses": [
-    "生效中",
-    "待确认",
-    "已回退"
-  ],
-  "filters": [
-    "全部油品",
-    "92号汽油",
-    "95号汽油",
-    "98号汽油",
-    "柴油"
-  ],
-  "fields": [
-    {
-      "key": "fuel",
-      "label": "油品",
-      "type": "select",
-      "options": [
-        "92号汽油",
-        "95号汽油",
-        "98号汽油",
-        "柴油"
-      ]
-    },
-    {
-      "key": "price",
-      "label": "挂牌价",
-      "type": "number"
-    },
-    {
-      "key": "operator",
-      "label": "操作员"
-    },
-    {
-      "key": "effectiveDate",
-      "label": "生效日期",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "fuel": "92号汽油",
-      "price": 7.62,
-      "operator": "站长",
-      "effectiveDate": "2026-06-30",
-      "status": "生效中",
-      "notes": "正常调价"
-    },
-    {
-      "fuel": "柴油",
-      "price": 7.18,
-      "operator": "值班经理",
-      "effectiveDate": "2026-06-30",
-      "status": "待确认",
-      "notes": "等待复核"
-    }
-  ],
-  "metricLabels": [
-    "油品数",
-    "待确认",
-    "平均挂牌价"
-  ]
-} as const;
+// ---------- 调价批次表单 ----------
 
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
-
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+const batchForm = reactive<BatchInput>({
+  id: "",
+  planNo: "",
+  fuelId: "f-92",
+  price: 0,
+  effectiveAt: new Date().toISOString().slice(0, 16),
+  operator: "",
+  source: "窗口"
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
+const lastOfflinePackage = ref<BatchInput | null>(null);
 
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+function submitBatch() {
+  const input: BatchInput = { ...batchForm, id: batchForm.id || undefined };
+  notice.value = ledger.submitBatch(input);
+  if (input.source === "断网补送") {
+    lastOfflinePackage.value = { ...input, id: input.id ?? "" };
+  }
+  batchForm.id = "";
+  batchForm.planNo = "";
+  batchForm.price = 0;
+  batchForm.operator = "";
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
+/** 断网恢复后重放上一包：批次ID相同，应被忽略且不重复记差额 */
+function replayOfflinePackage() {
+  if (!lastOfflinePackage.value) {
+    notice.value = "暂无可重放的断网包，请先用“断网补送”来源提交一笔";
+    return;
+  }
+  notice.value = ledger.submitBatch({ ...lastOfflinePackage.value });
 }
 
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+// ---------- 经理冲突裁定 ----------
+
+const resolutions = reactive<Record<string, Record<ConflictField, "local" | "incoming">>>({});
+
+function resolutionFor(batch: Batch) {
+  if (!resolutions[batch.id]) {
+    resolutions[batch.id] = { price: "local", effectiveAt: "local", operator: "local" };
+  }
+  return resolutions[batch.id];
 }
 
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
+function confirmConflicts(batch: Batch) {
+  ledger.resolveConflicts(batch.id, resolutionFor(batch));
+  notice.value = `批次 ${batch.planNo} 冲突已确认，转待裁草稿`;
 }
 
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+// ---------- 换班结账 ----------
+
+const shiftForm = reactive({ shiftNo: "", fuelId: "f-92", volume: 1000 });
+
+function closeShift() {
+  notice.value = ledger.closeShift(shiftForm.shiftNo, shiftForm.fuelId, Number(shiftForm.volume));
+  shiftForm.shiftNo = "";
 }
 
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+// ---------- 展示 ----------
+
+const sortedVersions = computed(() =>
+  [...ledger.versions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 12)
+);
+
+const statusClass = (status: string) =>
+  ({
+    生效: "ok",
+    待裁草稿: "warn",
+    待确认: "warn",
+    已驳回: "muted",
+    已替换: "muted",
+    未确认: "warn",
+    已确认: "ok",
+    已失效: "muted"
+  })[status] ?? "muted";
+
+const metrics = computed(() => [
+  { label: "生效批次", value: ledger.batches.filter((b) => b.status === "生效").length },
+  { label: "待裁定/待确认", value: ledger.awaitingCount },
+  { label: "未确认差额(¥)", value: ledger.pendingDiffTotal },
+  { label: "已确认差额(¥)", value: ledger.confirmedDiffTotal }
+]);
+
+function simulateFailure() {
+  ledger.simulateSaveFailureAndRecover();
+  notice.value = "已模拟保存失败并从上一个完整批次恢复";
 }
 </script>
 
@@ -196,77 +108,202 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">石油行业 · 站控价格账本</p>
+          <h1>油品价格维护</h1>
+          <p class="subtitle">
+            油品、调价批次、生效版本与换班小票一本账：同计划编号先到者占生效位，后到内容转待裁草稿；
+            断网包按字段合并、冲突两值保留，经理确认前不计售价和差额；保存失败从完整批次恢复，重放不重复记差额。
+          </p>
         </div>
         <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+          <span class="tag">Vue3</span>
+          <span class="tag">Pinia</span>
+          <span class="tag">TypeScript</span>
         </div>
       </header>
 
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article v-for="metric in metrics" :key="metric.label" class="metric">
+          <span>{{ metric.label }}</span>
+          <strong>{{ metric.value }}</strong>
         </article>
       </section>
 
+      <p v-if="notice" class="notice">{{ notice }}</p>
+
       <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
-
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
-          </div>
-
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
+        <div class="side">
+          <form class="panel" @submit.prevent="submitBatch">
+            <h2>调价批次录入</h2>
+            <div class="form-grid">
+              <label>
+                计划编号
+                <input v-model="batchForm.planNo" required placeholder="如 PLAN-2026-101" />
+              </label>
+              <label>
+                油品
+                <select v-model="batchForm.fuelId">
+                  <option v-for="fuel in ledger.fuels" :key="fuel.id" :value="fuel.id">{{ fuel.name }}</option>
+                </select>
+              </label>
+              <label>
+                挂牌价
+                <input v-model="batchForm.price" type="number" step="0.01" min="0" required />
+              </label>
+              <label>
+                生效时刻
+                <input v-model="batchForm.effectiveAt" type="datetime-local" required />
+              </label>
+              <label>
+                操作员
+                <input v-model="batchForm.operator" required placeholder="值班人姓名" />
+              </label>
+              <label>
+                来源
+                <select v-model="batchForm.source">
+                  <option>窗口</option>
+                  <option>断网补送</option>
+                </select>
+              </label>
+              <label>
+                批次ID（断网包自带，可留空）
+                <input v-model="batchForm.id" placeholder="重放去重依据" />
+              </label>
+              <button type="submit">提交批次</button>
             </div>
-          </div>
-        </section>
+          </form>
+
+          <form class="panel" @submit.prevent="closeShift">
+            <h2>换班结账</h2>
+            <div class="form-grid">
+              <label>
+                班次号
+                <input v-model="shiftForm.shiftNo" required placeholder="如 20261006-晚班" />
+              </label>
+              <label>
+                油品
+                <select v-model="shiftForm.fuelId">
+                  <option v-for="fuel in ledger.fuels" :key="fuel.id" :value="fuel.id">{{ fuel.name }}</option>
+                </select>
+              </label>
+              <label>
+                班次销量（升）
+                <input v-model="shiftForm.volume" type="number" min="0" step="1" required />
+              </label>
+              <button type="submit">开具小票</button>
+            </div>
+          </form>
+
+          <section class="panel">
+            <h2>容灾演练</h2>
+            <div class="actions">
+              <button type="button" class="secondary" @click="replayOfflinePackage">重放上一断网包</button>
+              <button type="button" class="secondary" @click="simulateFailure">模拟保存失败并恢复</button>
+            </div>
+          </section>
+        </div>
+
+        <div class="main-col">
+          <section class="list-panel">
+            <div class="toolbar"><h2>油品现价板</h2></div>
+            <div class="board">
+              <article v-for="fuel in ledger.priceBoard" :key="fuel.id" class="board-card">
+                <span>{{ fuel.name }}</span>
+                <strong>¥{{ fuel.price.toFixed(2) }}</strong>
+                <em>v{{ fuel.version }} · {{ fuel.effectiveAt }} 起生效</em>
+              </article>
+            </div>
+          </section>
+
+          <section class="list-panel">
+            <div class="toolbar"><h2>调价批次账本</h2></div>
+            <div class="record-grid">
+              <div v-if="ledger.batches.length === 0" class="empty">暂无批次，请从左侧录入</div>
+              <article v-for="batch in ledger.batches" :key="batch.id" class="record">
+                <div class="record-head">
+                  <p class="record-title">{{ batch.planNo }} / {{ ledger.fuelName(batch.fuelId) }} / ¥{{ batch.price.toFixed(2) }}</p>
+                  <span class="status" :class="statusClass(batch.status)">{{ batch.status }}</span>
+                </div>
+                <div class="details">
+                  <span>批次ID: {{ batch.id.slice(0, 8) }}</span>
+                  <span>来源: {{ batch.source }}</span>
+                  <span>生效时刻: {{ batch.effectiveAt }}</span>
+                  <span>操作员: {{ batch.operator }}</span>
+                  <span v-if="batch.version">生效版本: v{{ batch.version }}</span>
+                </div>
+
+                <div v-if="batch.conflicts.length > 0" class="conflicts">
+                  <p class="conflict-title">字段冲突（两值保留，经理确认前不计售价和差额）：</p>
+                  <div v-for="conflict in batch.conflicts" :key="conflict.field" class="conflict-row">
+                    <span>{{ CONFLICT_FIELD_LABELS[conflict.field] }}</span>
+                    <label>
+                      <input v-model="resolutionFor(batch)[conflict.field]" type="radio" value="local" />
+                      本地 {{ conflict.local }}
+                    </label>
+                    <label>
+                      <input v-model="resolutionFor(batch)[conflict.field]" type="radio" value="incoming" />
+                      补送 {{ conflict.incoming }}
+                    </label>
+                  </div>
+                  <div class="actions">
+                    <button type="button" @click="confirmConflicts(batch)">经理确认</button>
+                    <button type="button" class="danger" @click="ledger.rejectBatch(batch.id)">驳回</button>
+                  </div>
+                </div>
+
+                <div v-else-if="batch.status === '待裁草稿'" class="actions">
+                  <button type="button" @click="ledger.approveDraft(batch.id)">批准生效</button>
+                  <button type="button" class="danger" @click="ledger.rejectBatch(batch.id)">驳回</button>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="list-panel">
+            <div class="toolbar"><h2>换班小票</h2></div>
+            <div class="record-grid">
+              <div v-if="ledger.receipts.length === 0" class="empty">暂无小票</div>
+              <article v-for="receipt in ledger.receipts" :key="receipt.id" class="record">
+                <div class="record-head">
+                  <p class="record-title">{{ receipt.shiftNo }} / {{ ledger.fuelName(receipt.fuelId) }}</p>
+                  <span class="status" :class="statusClass(receipt.status)">{{ receipt.status }}</span>
+                </div>
+                <div class="details">
+                  <span>销量: {{ receipt.volume }}L</span>
+                  <span>计价: ¥{{ receipt.price.toFixed(2) }}（v{{ receipt.version }}）</span>
+                  <span>上版价: ¥{{ receipt.prevPrice.toFixed(2) }}</span>
+                  <span>差额: ¥{{ receipt.diff.toFixed(2) }}</span>
+                </div>
+                <div v-if="receipt.status === '未确认'" class="actions">
+                  <button type="button" @click="ledger.confirmReceipt(receipt.id)">确认差额</button>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="list-panel">
+            <div class="toolbar"><h2>生效版本时间线</h2></div>
+            <div class="record-grid">
+              <article v-for="version in sortedVersions" :key="`${version.fuelId}-${version.version}`" class="record">
+                <div class="record-head">
+                  <p class="record-title">{{ ledger.fuelName(version.fuelId) }} · v{{ version.version }} · ¥{{ version.price.toFixed(2) }}</p>
+                  <span class="status ok">生效</span>
+                </div>
+                <div class="details">
+                  <span>计划编号: {{ version.planNo }}</span>
+                  <span>生效时刻: {{ version.effectiveAt }}</span>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="list-panel">
+            <div class="toolbar"><h2>事件日志</h2></div>
+            <ul class="event-log">
+              <li v-for="(event, index) in ledger.events" :key="index">{{ event }}</li>
+            </ul>
+          </section>
+        </div>
       </section>
     </div>
   </main>
